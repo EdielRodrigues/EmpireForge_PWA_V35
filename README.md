@@ -1,25 +1,25 @@
-# Empire Forge Backend V35
+# Empire Forge Backend V35.2 — PostgreSQL
 
-## O que já está pronto
-- Cadastro com nome, e-mail, telefone/DDD e senha.
-- Login com JWT.
-- ID único de jogador.
-- Saldo de gemas por usuário.
-- Criação de Pix para os 4 pacotes oficiais definidos no jogo.
-- Webhook de pagamento.
-- Crédito automático de gemas **uma única vez** após status `approved`.
-- Consulta de status pelo frontend.
+Esta versão remove completamente SQLite/better-sqlite3.
 
-## Para ativar
-1. Publique esta pasta em um servidor Node.js (por exemplo, Render).
-2. Copie `.env.example` para `.env` e configure:
-   - `JWT_SECRET`
-   - `MERCADOPAGO_ACCESS_TOKEN`
-   - `PUBLIC_BACKEND_URL`
-   - `FRONTEND_ORIGIN`
-3. No `config.js` do PWA, coloque a URL do backend em `API_BASE`.
-4. Configure a URL HTTPS do webhook no provedor de pagamento.
-5. Antes de produção, configure validação de assinatura do webhook conforme a configuração da sua conta/provedor.
+## Variáveis obrigatórias no Render
+- JWT_SECRET
+- DATABASE_URL
+- PUBLIC_BACKEND_URL
+- MERCADOPAGO_ACCESS_TOKEN
+- FRONTEND_ORIGIN (quando o site estiver publicado)
 
 ## Banco
-A V35 usa SQLite local no backend para deixar o fluxo completo e testável. Antes de escalar multiplayer, migrar para um banco gerenciado é recomendado.
+As tabelas `users` e `pix_orders` são criadas automaticamente no primeiro start.
+
+## Teste
+Abra `/health`.
+O esperado:
+- online: true
+- version: 35.2-postgres
+- database: true
+- databaseType: postgresql
+- pixConfigured: true (se o token do Mercado Pago estiver configurado)
+
+## Importante
+Dados que estavam apenas no SQLite antigo não são copiados automaticamente para o PostgreSQL.
