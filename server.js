@@ -43,12 +43,12 @@ CREATE TABLE IF NOT EXISTS pix_orders(
 );
 `);
 
-const PACKS={
-  500:799,
-  1000:1699,
-  1500:3399,
-  2000:6699
-};
+const PACKS=Object.freeze({
+  500:  {amount_cents:799,  label:"R$ 7,99"},
+  1000: {amount_cents:1699, label:"R$ 16,99"},
+  1500: {amount_cents:3399, label:"R$ 33,99"},
+  2000: {amount_cents:6699, label:"R$ 66,99"}
+});
 
 function userPublic(u){return {id:u.id,name:u.name,email:u.email,phone:u.phone,gems:Number(u.gems||0)}}
 function sign(user){return jwt.sign({sub:user.id,email:user.email},JWT_SECRET,{expiresIn:"30d"})}
@@ -63,7 +63,7 @@ function auth(req,res,next){
 }
 function uid(prefix){return prefix+"_"+crypto.randomUUID()}
 
-app.get("/health",(req,res)=>res.json({online:true,service:"Empire Forge API",pixConfigured:!!ACCESS_TOKEN}));
+app.get("/health",(req,res)=>res.json({online:true,service:"Empire Forge API",version:"35.1",pixConfigured:!!ACCESS_TOKEN,packs:[500,1000,1500,2000]}));
 
 app.post("/api/auth/register",async(req,res)=>{
   try{
@@ -114,11 +114,30 @@ async function mpFetch(path,options={}){
   return data;
 }
 
+
+app.get("/api/wallet",auth,(req,res)=>{
+  const u=db.prepare("SELECT id,name,email,gems FROM users WHERE id=?").get(req.user.id);
+  if(!u)return res.status(404).json({error:"Usuário não encontrado."});
+  res.set("Cache-Control","no-store");
+  res.json({id:u.id,name:u.name,email:u.email,gems:Number(u.gems||0)});
+});
+
+app.get("/api/store/packs",(req,res)=>{
+  res.set("Cache-Control","no-store");
+  res.json({
+    500:{gems:500,amountCents:799,price:"R$ 7,99"},
+    1000:{gems:1000,amountCents:1699,price:"R$ 16,99"},
+    1500:{gems:1500,amountCents:3399,price:"R$ 33,99"},
+    2000:{gems:2000,amountCents:6699,price:"R$ 66,99"}
+  });
+});
+
 app.post("/api/pix/create",auth,async(req,res)=>{
   try{
     const gems=Number(req.body.gems);
-    const cents=PACKS[gems];
-    if(!cents)return res.status(400).json({error:"Pacote inválido."});
+    const pack=PACKS[gems];
+    if(!pack)return res.status(400).json({error:"Pacote inválido."});
+    const cents=pack.amount_cents;
     if(!PUBLIC_BACKEND_URL)return res.status(500).json({error:"PUBLIC_BACKEND_URL não configurada."});
 
     const orderId=uid("ORDER");
@@ -153,16 +172,33 @@ app.post("/api/pix/create",auth,async(req,res)=>{
 
 function creditApprovedPayment(payment){
   const orderId=String(payment.external_reference||"");
-  if(!orderId||String(payment.status)!=="approved")return false;
+  if(!orderId || String(payment.status)!=="approved") return false;
 
   const tx=db.transaction(()=>{
     const ord=db.prepare("SELECT * FROM pix_orders WHERE id=?").get(orderId);
-    if(!ord)return false;
-    if(ord.credited)return true;
-    if(String(ord.payment_id)!==String(payment.id))return false;
+    if(!ord) return false;
+    if(ord.credited) return true;
+    if(String(ord.payment_id)!==String(payment.id)) return false;
 
-    db.prepare("UPDATE pix_orders SET status='approved',credited=1,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(orderId);
-    db.prepare("UPDATE users SET gems=gems+? WHERE id=?").run(ord.gems,ord.user_id);
+    const expected=PACKS[Number(ord.gems)];
+    if(!expected) throw new Error("Pacote do pedido não existe.");
+
+    // Confere valor pago em centavos antes de liberar gemas.
+    const paidCents=Math.round(Number(payment.transaction_amount||0)*100);
+    if(paidCents!==Number(ord.amount_cents) || paidCents!==Number(expected.amount_cents)){
+      db.prepare("UPDATE pix_orders SET status='amount_mismatch',updated_at=CURRENT_TIMESTAMP WHERE id=?").run(orderId);
+      console.error("Valor divergente", {orderId,paidCents,expected:expected.amount_cents,gems:ord.gems});
+      return false;
+    }
+
+    // Crédito idempotente: marca e adiciona em uma única transação.
+    const changed=db.prepare(
+      "UPDATE pix_orders SET status='approved',credited=1,updated_at=CURRENT_TIMESTAMP WHERE id=? AND credited=0"
+    ).run(orderId);
+    if(changed.changes!==1) return true;
+
+    db.prepare("UPDATE users SET gems=gems+? WHERE id=?").run(Number(ord.gems),ord.user_id);
+    console.log("Gemas creditadas", {orderId,userId:ord.user_id,gems:ord.gems,paymentId:payment.id});
     return true;
   });
   return tx();
@@ -185,6 +221,7 @@ app.post("/api/pix/webhook",async(req,res)=>{
 });
 
 app.get("/api/pix/status/:paymentId",auth,async(req,res)=>{
+  res.set("Cache-Control","no-store");
   try{
     const id=String(req.params.paymentId);
     let ord=db.prepare("SELECT * FROM pix_orders WHERE payment_id=? AND user_id=?").get(id,req.user.id);
