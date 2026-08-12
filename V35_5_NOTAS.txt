@@ -1,6 +1,0 @@
-Backend V35.5
-- PostgreSQL agora guarda gold e elixir por usuário.
-- Pix de recursos em /api/store/resource-pix.
-- Webhook credita 10.000 Ouro ou Elixir uma única vez.
-- /api/wallet devolve gems, gold e elixir.
-- /api/pix/status devolve dados de compras de recurso.
