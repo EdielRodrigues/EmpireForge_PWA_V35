@@ -1,6 +1,6 @@
 {
   "name": "empire-forge-backend",
-  "version": "35.5.0",
+  "version": "35.6.0",
   "private": true,
   "type": "commonjs",
   "scripts": {

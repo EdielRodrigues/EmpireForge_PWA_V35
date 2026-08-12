@@ -108,6 +108,22 @@ async function initDb() {
   `);
 
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS resource_transactions (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      resource_type TEXT NOT NULL,
+      amount BIGINT NOT NULL,
+      reason TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_resource_transactions_user_id
+    ON resource_transactions(user_id);
+  `);
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS gem_transactions (
       id TEXT PRIMARY KEY,
       user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -268,7 +284,7 @@ app.get("/health", async (req, res) => {
   res.json({
     online: true,
     service: "Empire Forge API",
-    version: "35.5-resources",
+    version: "35.6-resources-sync",
     pixConfigured: !!ACCESS_TOKEN,
     database,
     databaseType: "postgresql",
@@ -363,6 +379,70 @@ app.get("/api/auth/me", auth, async (req, res) => {
   );
 
   res.json({ user: userPublic(result.rows[0]) });
+});
+
+
+app.post("/api/resources/add", auth, async (req, res) => {
+  const resource = String(req.body?.resource || "").toLowerCase();
+  const amount = Math.floor(Number(req.body?.amount || 0));
+  const reason = String(req.body?.reason || "production").slice(0,80);
+  const transactionId = String(req.body?.transactionId || "").trim();
+
+  if (!["gold","elixir"].includes(resource)) {
+    return res.status(400).json({error:"Recurso inválido."});
+  }
+  if (!Number.isInteger(amount) || amount <= 0 || amount > 100000000) {
+    return res.status(400).json({error:"Quantidade inválida."});
+  }
+  if (!transactionId || transactionId.length > 120) {
+    return res.status(400).json({error:"transactionId obrigatório."});
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const existing = await client.query(
+      "SELECT amount,resource_type FROM resource_transactions WHERE id=$1 AND user_id=$2 LIMIT 1",
+      [transactionId, req.user.id]
+    );
+
+    if (existing.rows[0]) {
+      const u = await client.query("SELECT gold,elixir FROM users WHERE id=$1",[req.user.id]);
+      await client.query("COMMIT");
+      return res.json({
+        ok:true,
+        duplicate:true,
+        gold:Number(u.rows[0]?.gold||0),
+        elixir:Number(u.rows[0]?.elixir||0)
+      });
+    }
+
+    const column = resource === "gold" ? "gold" : "elixir";
+    const updated = await client.query(
+      `UPDATE users SET ${column}=COALESCE(${column},0)+$1 WHERE id=$2 RETURNING gold,elixir`,
+      [amount, req.user.id]
+    );
+
+    await client.query(
+      "INSERT INTO resource_transactions(id,user_id,resource_type,amount,reason) VALUES($1,$2,$3,$4,$5)",
+      [transactionId, req.user.id, resource, amount, reason]
+    );
+
+    await client.query("COMMIT");
+    return res.json({
+      ok:true,
+      gold:Number(updated.rows[0]?.gold||0),
+      elixir:Number(updated.rows[0]?.elixir||0)
+    });
+
+  } catch(e) {
+    await client.query("ROLLBACK");
+    console.error("resource add error",e);
+    return res.status(500).json({error:"Não foi possível salvar o recurso."});
+  } finally {
+    client.release();
+  }
 });
 
 app.get("/api/wallet", auth, async (req, res) => {
