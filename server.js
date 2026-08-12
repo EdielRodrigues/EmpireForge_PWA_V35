@@ -26,11 +26,18 @@ const pool = new Pool({
 });
 
 const PACKS = Object.freeze({
-  500:  { amount_cents: 799,  label: "R$ 7,99" },
-  1000: { amount_cents: 1699, label: "R$ 16,99" },
-  1500: { amount_cents: 3399, label: "R$ 33,99" },
-  2000: { amount_cents: 6699, label: "R$ 66,99" }
+  70: { amount_cents: 490, label: "R$ 4,90" },
+  170: { amount_cents: 1590, label: "R$ 15,90" },
+  270: { amount_cents: 2590, label: "R$ 25,90" },
+  370: { amount_cents: 3590, label: "R$ 35,90" },
+  470: { amount_cents: 4590, label: "R$ 45,90" },
+  670: { amount_cents: 5090, label: "R$ 50,90" }
 });
+const RESOURCE_PACKS = Object.freeze({
+  gold:   { resource_type:"gold",   resource_amount:10000, amount_cents:299, label:"R$ 2,99" },
+  elixir: { resource_type:"elixir", resource_amount:10000, amount_cents:399, label:"R$ 3,99" }
+});
+
 
 function uid(prefix) {
   return prefix + "_" + crypto.randomUUID();
@@ -42,7 +49,9 @@ function userPublic(u) {
     name: u.name,
     email: u.email,
     phone: u.phone,
-    gems: Number(u.gems || 0)
+    gems: Number(u.gems || 0),
+    gold: Number(u.gold || 0),
+    elixir: Number(u.elixir || 0)
   };
 }
 
@@ -67,6 +76,9 @@ async function initDb() {
     );
   `);
 
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS gold BIGINT NOT NULL DEFAULT 0;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS elixir BIGINT NOT NULL DEFAULT 0;`);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS pix_orders (
       id TEXT PRIMARY KEY,
@@ -80,6 +92,10 @@ async function initDb() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
+
+  await pool.query(`ALTER TABLE pix_orders ADD COLUMN IF NOT EXISTS order_type TEXT NOT NULL DEFAULT 'gems';`);
+  await pool.query(`ALTER TABLE pix_orders ADD COLUMN IF NOT EXISTS resource_type TEXT;`);
+  await pool.query(`ALTER TABLE pix_orders ADD COLUMN IF NOT EXISTS resource_amount INTEGER NOT NULL DEFAULT 0;`);
 
   await pool.query(`
     CREATE INDEX IF NOT EXISTS idx_pix_orders_user_id
@@ -157,85 +173,71 @@ async function creditApprovedPayment(payment) {
   if (!orderId || String(payment.status) !== "approved") return false;
 
   const client = await pool.connect();
-
   try {
     await client.query("BEGIN");
-
-    const orderResult = await client.query(
+    const { rows } = await client.query(
       "SELECT * FROM pix_orders WHERE id = $1 FOR UPDATE",
       [orderId]
     );
-
-    const order = orderResult.rows[0];
-    if (!order) {
-      await client.query("ROLLBACK");
-      return false;
-    }
-
-    if (order.credited === true) {
-      await client.query("COMMIT");
-      return true;
-    }
-
-    if (String(order.payment_id) !== String(payment.id)) {
-      await client.query("ROLLBACK");
-      return false;
-    }
-
-    const expected = PACKS[Number(order.gems)];
-    if (!expected) {
-      throw new Error("Pacote do pedido não existe.");
-    }
+    const order = rows[0];
+    if (!order) { await client.query("ROLLBACK"); return false; }
+    if (order.credited === true) { await client.query("COMMIT"); return true; }
+    if (String(order.payment_id) !== String(payment.id)) { await client.query("ROLLBACK"); return false; }
 
     const paidCents = Math.round(Number(payment.transaction_amount || 0) * 100);
+    let expectedCents = 0;
 
-    if (
-      paidCents !== Number(order.amount_cents) ||
-      paidCents !== Number(expected.amount_cents)
-    ) {
+    if (order.order_type === "resource") {
+      const rp = RESOURCE_PACKS[String(order.resource_type || "")];
+      if (!rp || Number(order.resource_amount) !== Number(rp.resource_amount)) {
+        throw new Error("Pacote de recurso inválido.");
+      }
+      expectedCents = Number(rp.amount_cents);
+    } else {
+      const gp = PACKS[Number(order.gems)];
+      if (!gp) throw new Error("Pacote de gemas inválido.");
+      expectedCents = Number(gp.amount_cents);
+    }
+
+    if (paidCents !== Number(order.amount_cents) || paidCents !== expectedCents) {
       await client.query(
-        `UPDATE pix_orders
-         SET status = 'amount_mismatch', updated_at = NOW()
-         WHERE id = $1`,
+        "UPDATE pix_orders SET status='amount_mismatch',updated_at=NOW() WHERE id=$1",
         [orderId]
       );
       await client.query("COMMIT");
-
-      console.error("Valor divergente", {
-        orderId,
-        paidCents,
-        expected: expected.amount_cents,
-        gems: order.gems
-      });
-
+      console.error("Valor divergente", {orderId,paidCents,expectedCents});
       return false;
     }
 
-    const updateOrder = await client.query(
-      `UPDATE pix_orders
-       SET status = 'approved', credited = TRUE, updated_at = NOW()
-       WHERE id = $1 AND credited = FALSE
-       RETURNING id`,
+    const mark = await client.query(
+      `UPDATE pix_orders SET status='approved',credited=TRUE,updated_at=NOW()
+       WHERE id=$1 AND credited=FALSE RETURNING id`,
       [orderId]
     );
 
-    if (updateOrder.rowCount === 1) {
-      await client.query(
-        "UPDATE users SET gems = gems + $1 WHERE id = $2",
-        [Number(order.gems), order.user_id]
-      );
-
-      console.log("Gemas creditadas", {
-        orderId,
-        userId: order.user_id,
-        gems: order.gems,
-        paymentId: payment.id
-      });
+    if (mark.rowCount === 1) {
+      if (order.order_type === "resource") {
+        if (order.resource_type === "gold") {
+          await client.query("UPDATE users SET gold=gold+$1 WHERE id=$2",
+            [Number(order.resource_amount),order.user_id]);
+        } else if (order.resource_type === "elixir") {
+          await client.query("UPDATE users SET elixir=elixir+$1 WHERE id=$2",
+            [Number(order.resource_amount),order.user_id]);
+        } else {
+          throw new Error("Tipo de recurso inválido.");
+        }
+        console.log("Recurso creditado", {
+          orderId,userId:order.user_id,type:order.resource_type,amount:order.resource_amount
+        });
+      } else {
+        await client.query("UPDATE users SET gems=gems+$1 WHERE id=$2",
+          [Number(order.gems),order.user_id]);
+        console.log("Gemas creditadas", {orderId,userId:order.user_id,gems:order.gems});
+      }
     }
 
     await client.query("COMMIT");
     return true;
-
   } catch (e) {
     await client.query("ROLLBACK");
     throw e;
@@ -266,11 +268,11 @@ app.get("/health", async (req, res) => {
   res.json({
     online: true,
     service: "Empire Forge API",
-    version: "35.3-wallet",
+    version: "35.5-resources",
     pixConfigured: !!ACCESS_TOKEN,
     database,
     databaseType: "postgresql",
-    packs: [500, 1000, 1500, 2000]
+    packs: [70,170,270,370,470,670], resourcePacks: {gold:299,elixir:399}
   });
 });
 
@@ -365,7 +367,7 @@ app.get("/api/auth/me", auth, async (req, res) => {
 
 app.get("/api/wallet", auth, async (req, res) => {
   const result = await pool.query(
-    "SELECT id,name,email,gems FROM users WHERE id = $1 LIMIT 1",
+    "SELECT id,name,email,gems,gold,elixir FROM users WHERE id = $1 LIMIT 1",
     [req.user.id]
   );
 
@@ -381,7 +383,9 @@ app.get("/api/wallet", auth, async (req, res) => {
     id: u.id,
     name: u.name,
     email: u.email,
-    gems: Number(u.gems || 0)
+    gems: Number(u.gems || 0),
+    gold: Number(u.gold || 0),
+    elixir: Number(u.elixir || 0)
   });
 });
 
@@ -450,11 +454,62 @@ app.get("/api/store/packs", (req, res) => {
   res.set("Cache-Control", "no-store");
 
   res.json({
-    500:  { gems: 500,  amountCents: 799,  price: "R$ 7,99" },
-    1000: { gems: 1000, amountCents: 1699, price: "R$ 16,99" },
-    1500: { gems: 1500, amountCents: 3399, price: "R$ 33,99" },
-    2000: { gems: 2000, amountCents: 6699, price: "R$ 66,99" }
+    70: { gems: 70, amountCents: 490, price: "R$ 4,90" },
+    170: { gems: 170, amountCents: 1590, price: "R$ 15,90" },
+    270: { gems: 270, amountCents: 2590, price: "R$ 25,90" },
+    370: { gems: 370, amountCents: 3590, price: "R$ 35,90" },
+    470: { gems: 470, amountCents: 4590, price: "R$ 45,90" },
+    670: { gems: 670, amountCents: 5090, price: "R$ 50,90" }
   });
+});
+
+
+app.post("/api/store/resource-pix", auth, async (req, res) => {
+  try {
+    const resource = String(req.body.resource || "").toLowerCase();
+    const pack = RESOURCE_PACKS[resource];
+    if (!pack) return res.status(400).json({error:"Pacote de recurso inválido."});
+    if (!PUBLIC_BACKEND_URL) return res.status(500).json({error:"PUBLIC_BACKEND_URL não configurada."});
+
+    const orderId = uid("RESOURCE");
+    const payload = {
+      transaction_amount: pack.amount_cents / 100,
+      description: `Empire Forge - 10.000 ${resource === "gold" ? "Ouro" : "Elixir"}`,
+      payment_method_id: "pix",
+      payer: { email: req.user.email },
+      external_reference: orderId,
+      notification_url: PUBLIC_BACKEND_URL + "/api/pix/webhook"
+    };
+
+    const payment = await mpFetch("/v1/payments", {
+      method:"POST",
+      headers:{"X-Idempotency-Key":orderId},
+      body:JSON.stringify(payload)
+    });
+
+    await pool.query(
+      `INSERT INTO pix_orders
+       (id,payment_id,user_id,gems,amount_cents,status,order_type,resource_type,resource_amount)
+       VALUES($1,$2,$3,0,$4,$5,'resource',$6,$7)`,
+      [orderId,String(payment.id),req.user.id,pack.amount_cents,
+       String(payment.status||"pending"),pack.resource_type,pack.resource_amount]
+    );
+
+    const td=payment.point_of_interaction?.transaction_data||{};
+    res.json({
+      orderId,
+      paymentId:String(payment.id),
+      status:payment.status||"pending",
+      orderType:"resource",
+      resourceType:pack.resource_type,
+      resourceAmount:pack.resource_amount,
+      qrCode:td.qr_code||"",
+      qrBase64:td.qr_code_base64||""
+    });
+  } catch(e) {
+    console.error("resource pix",e);
+    res.status(500).json({error:e.message||"Erro ao gerar Pix do recurso."});
+  }
 });
 
 app.post("/api/pix/create", auth, async (req, res) => {
@@ -605,7 +660,7 @@ app.get("/api/pix/status/:paymentId", auth, async (req, res) => {
     order = orderResult.rows[0];
 
     const userResult = await pool.query(
-      "SELECT gems FROM users WHERE id = $1 LIMIT 1",
+      "SELECT gems,gold,elixir FROM users WHERE id = $1 LIMIT 1",
       [req.user.id]
     );
 
@@ -613,8 +668,13 @@ app.get("/api/pix/status/:paymentId", auth, async (req, res) => {
 
     res.json({
       status: order.status,
-      gems: Number(order.gems),
+      orderType: order.order_type || "gems",
+      gems: Number(order.gems || 0),
+      resourceType: order.resource_type || null,
+      resourceAmount: Number(order.resource_amount || 0),
       balance: Number(user?.gems || 0),
+      gold: Number(user?.gold || 0),
+      elixir: Number(user?.elixir || 0),
       credited: order.credited === true
     });
 
@@ -632,7 +692,7 @@ async function start() {
     console.log("PostgreSQL conectado e tabelas prontas.");
 
     app.listen(PORT, () => {
-      console.log("Empire Forge API V35.2 PostgreSQL online na porta", PORT);
+      console.log("Empire Forge API V35.5 Recursos online na porta", PORT);
     });
 
   } catch (e) {
