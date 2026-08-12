@@ -90,6 +90,21 @@ async function initDb() {
     CREATE INDEX IF NOT EXISTS idx_pix_orders_payment_id
     ON pix_orders(payment_id);
   `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS gem_transactions (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      amount INTEGER NOT NULL,
+      reason TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_gem_transactions_user_id
+    ON gem_transactions(user_id);
+  `);
 }
 
 async function auth(req, res, next) {
@@ -251,7 +266,7 @@ app.get("/health", async (req, res) => {
   res.json({
     online: true,
     service: "Empire Forge API",
-    version: "35.2-postgres",
+    version: "35.3-wallet",
     pixConfigured: !!ACCESS_TOKEN,
     database,
     databaseType: "postgresql",
@@ -368,6 +383,67 @@ app.get("/api/wallet", auth, async (req, res) => {
     email: u.email,
     gems: Number(u.gems || 0)
   });
+});
+
+
+app.post("/api/wallet/spend", auth, async (req, res) => {
+  const amount = Math.floor(Number(req.body?.amount || 0));
+  const reason = String(req.body?.reason || "game_spend").slice(0, 80);
+  const transactionId = String(req.body?.transactionId || "").trim();
+
+  if (!Number.isInteger(amount) || amount <= 0 || amount > 100000) {
+    return res.status(400).json({ error: "Quantidade de gemas inválida." });
+  }
+  if (!transactionId || transactionId.length > 120) {
+    return res.status(400).json({ error: "transactionId obrigatório." });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const existing = await client.query(
+      "SELECT amount FROM gem_transactions WHERE id = $1 AND user_id = $2 LIMIT 1",
+      [transactionId, req.user.id]
+    );
+    if (existing.rows[0]) {
+      const u = await client.query("SELECT gems FROM users WHERE id = $1", [req.user.id]);
+      await client.query("COMMIT");
+      return res.json({ ok: true, duplicate: true, spent: Number(existing.rows[0].amount), balance: Number(u.rows[0]?.gems || 0) });
+    }
+
+    const updated = await client.query(
+      `UPDATE users
+       SET gems = gems - $1
+       WHERE id = $2 AND gems >= $1
+       RETURNING gems`,
+      [amount, req.user.id]
+    );
+
+    if (!updated.rows[0]) {
+      const current = await client.query("SELECT gems FROM users WHERE id = $1", [req.user.id]);
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        error: "Saldo de gemas insuficiente.",
+        balance: Number(current.rows[0]?.gems || 0)
+      });
+    }
+
+    await client.query(
+      "INSERT INTO gem_transactions (id,user_id,amount,reason) VALUES ($1,$2,$3,$4)",
+      [transactionId, req.user.id, amount, reason]
+    );
+
+    await client.query("COMMIT");
+    res.set("Cache-Control", "no-store");
+    return res.json({ ok: true, spent: amount, balance: Number(updated.rows[0].gems) });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("wallet spend error", e);
+    return res.status(500).json({ error: "Não foi possível descontar as gemas." });
+  } finally {
+    client.release();
+  }
 });
 
 app.get("/api/store/packs", (req, res) => {
