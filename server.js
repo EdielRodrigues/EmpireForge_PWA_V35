@@ -78,6 +78,9 @@ async function initDb() {
 
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS gold BIGINT NOT NULL DEFAULT 0;`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS elixir BIGINT NOT NULL DEFAULT 0;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS game_state JSONB;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen TIMESTAMPTZ;`);
+
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS pix_orders (
@@ -284,7 +287,7 @@ app.get("/health", async (req, res) => {
   res.json({
     online: true,
     service: "Empire Forge API",
-    version: "35.6-resources-sync",
+    version: "35.7-multiplayer",
     pixConfigured: !!ACCESS_TOKEN,
     database,
     databaseType: "postgresql",
@@ -442,6 +445,121 @@ app.post("/api/resources/add", auth, async (req, res) => {
     return res.status(500).json({error:"Não foi possível salvar o recurso."});
   } finally {
     client.release();
+  }
+});
+
+
+function sanitizeGameState(input) {
+  const s = input && typeof input === "object" ? input : {};
+  const buildings = Array.isArray(s.buildings) ? s.buildings.slice(0,250).map(b => ({
+    id:String(b.id||"").slice(0,80),
+    type:String(b.type||"").slice(0,40),
+    x:Number(b.x||0),
+    y:Number(b.y||0),
+    level:Math.max(1,Number(b.level||1)),
+    readyAt:Number(b.readyAt||0)
+  })) : [];
+
+  return {
+    playerName:String(s.playerName||"Jogador").slice(0,30),
+    trophies:Math.max(0,Number(s.trophies||0)),
+    level:Math.max(1,Number(s.level||1)),
+    gold:Math.max(0,Number(s.gold||0)),
+    elixir:Math.max(0,Number(s.elixir||0)),
+    buildings,
+    updatedAt:Date.now()
+  };
+}
+
+app.post("/api/game/state", auth, async (req,res) => {
+  try {
+    const gameState=sanitizeGameState(req.body?.state);
+    await pool.query(
+      "UPDATE users SET game_state=$1::jsonb,last_seen=NOW() WHERE id=$2",
+      [JSON.stringify(gameState),req.user.id]
+    );
+    res.json({ok:true,updatedAt:gameState.updatedAt});
+  } catch(e) {
+    console.error("save game state",e);
+    res.status(500).json({error:"Não foi possível salvar a vila."});
+  }
+});
+
+app.get("/api/game/state", auth, async (req,res) => {
+  try {
+    const {rows}=await pool.query(
+      "SELECT game_state,last_seen FROM users WHERE id=$1 LIMIT 1",
+      [req.user.id]
+    );
+    res.set("Cache-Control","no-store");
+    res.json({state:rows[0]?.game_state||null,lastSeen:rows[0]?.last_seen||null});
+  } catch(e) {
+    res.status(500).json({error:"Não foi possível carregar a vila."});
+  }
+});
+
+function fallbackOpponent(requester) {
+  const lv=Math.max(1,Number(requester?.game_state?.buildings?.find?.(b=>b.type==="town")?.level||1));
+  return {
+    source:"fallback",
+    userId:null,
+    name:"Vila de Treinamento",
+    trophies:Math.max(50,lv*80),
+    gold:1200+lv*600,
+    elixir:1000+lv*550,
+    gameState:{
+      playerName:"Vila de Treinamento",
+      trophies:Math.max(50,lv*80),
+      buildings:[
+        {id:"ftown",type:"town",x:8,y:5,level:lv},
+        {id:"fc1",type:"cannon",x:5,y:4,level:Math.max(1,lv)},
+        {id:"ft1",type:"tower",x:11,y:4,level:Math.max(1,lv)},
+        {id:"fg1",type:"storage",x:6,y:8,level:Math.max(1,lv)},
+        {id:"fe1",type:"elixirstorage",x:10,y:8,level:Math.max(1,lv)},
+        {id:"fb1",type:"barracks",x:8,y:9,level:Math.max(1,lv)}
+      ]
+    }
+  };
+}
+
+app.get("/api/opponents/search", auth, async (req,res) => {
+  try {
+    await pool.query("UPDATE users SET last_seen=NOW() WHERE id=$1",[req.user.id]);
+    const selfQ=await pool.query("SELECT game_state FROM users WHERE id=$1",[req.user.id]);
+    const self=selfQ.rows[0]||{};
+
+    const {rows}=await pool.query(
+      `SELECT id,name,email,trophies,gold,elixir,game_state,last_seen
+       FROM users
+       WHERE id<>$1 AND game_state IS NOT NULL
+       ORDER BY last_seen DESC NULLS LAST, RANDOM()
+       LIMIT 20`,
+      [req.user.id]
+    );
+
+    if(!rows.length){
+      return res.json({found:false,fallback:true,opponent:fallbackOpponent(self)});
+    }
+
+    const row=rows[Math.floor(Math.random()*rows.length)];
+    const gs=row.game_state||{};
+    return res.json({
+      found:true,
+      fallback:false,
+      opponent:{
+        source:"real",
+        userId:row.id,
+        name:row.name||gs.playerName||"Jogador",
+        trophies:Number(gs.trophies??row.trophies??0),
+        gold:Number(row.gold??gs.gold??0),
+        elixir:Number(row.elixir??gs.elixir??0),
+        gameState:gs,
+        lastSeen:row.last_seen
+      }
+    });
+  } catch(e) {
+    console.error("opponent search",e);
+    res.status(500).json({error:"Falha ao buscar oponente."});
   }
 });
 
