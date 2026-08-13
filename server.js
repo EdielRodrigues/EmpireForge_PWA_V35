@@ -300,7 +300,7 @@ app.get("/health", async (req, res) => {
   res.json({
     online: true,
     service: "Empire Forge API",
-    version: "35.9-real-matchmaking",
+    version: "35.10-real-matchmaking-save",
     pixConfigured: !!ACCESS_TOKEN,
     database,
     databaseType: "postgresql",
@@ -729,7 +729,7 @@ app.get("/api/opponents/search", auth, async (req,res) => {
 
     // Busca SOMENTE outras contas reais com ID e vila salva.
     const {rows}=await pool.query(
-      `SELECT id,name,email,trophies,gold,elixir,game_state,last_seen
+      `SELECT id,name,email,gold,elixir,game_state,last_seen
        FROM users
        WHERE id <> $1
          AND game_state IS NOT NULL
@@ -772,7 +772,7 @@ app.get("/api/opponents/search", auth, async (req,res) => {
         source:"real",
         userId:String(row.id),
         name:row.name||gs.playerName||"Jogador",
-        trophies:Number(gs.trophies??row.trophies??0),
+        trophies:Number(gs.trophies??0),
         gold:Number(row.gold??gs.gold??0),
         elixir:Number(row.elixir??gs.elixir??0),
         gameState:gs,
@@ -795,15 +795,91 @@ app.get("/api/health", async (req,res) => {
     res.json({
       online:true,
       service:"Empire Forge API",
-      version:"35.9-real-matchmaking",
+      version:"35.10-real-matchmaking-save",
       database:true,
       databaseType:"postgresql",
       users:Number(q.rows[0]?.total||0),
       villages:Number(q.rows[0]?.villages||0),
-      matchmaking:"real-id"
+      matchmaking:"real-id",
+      gameStateIncludes:["buildings","army","queue","lab","hero","stats"],
+      backups:true
     });
   }catch(e){
     res.status(503).json({online:false,database:false,error:"database_unavailable"});
+  }
+});
+
+
+app.get("/api/account/status", auth, async (req,res) => {
+  try{
+    const q = await pool.query(
+      `SELECT id,name,email,gems,gold,elixir,game_state,last_seen,created_at
+       FROM users
+       WHERE id=$1
+       LIMIT 1`,
+      [req.user.id]
+    );
+
+    const u = q.rows[0];
+    if(!u) return res.status(404).json({error:"Conta não encontrada."});
+
+    const gs = u.game_state && typeof u.game_state === "object" ? u.game_state : {};
+    const buildings = Array.isArray(gs.buildings) ? gs.buildings : [];
+    const army = Array.isArray(gs.army) ? gs.army : [];
+    const queue = Array.isArray(gs.queue) ? gs.queue : [];
+
+    const backups = await pool.query(
+      `SELECT COUNT(*)::int AS total, MAX(created_at) AS latest
+       FROM game_state_backups
+       WHERE user_id=$1`,
+      [req.user.id]
+    );
+
+    const opponents = await pool.query(
+      `SELECT COUNT(*)::int AS total
+       FROM users
+       WHERE id<>$1
+         AND game_state IS NOT NULL
+         AND jsonb_typeof(game_state)='object'
+         AND jsonb_array_length(COALESCE(game_state->'buildings','[]'::jsonb)) > 0`,
+      [req.user.id]
+    );
+
+    res.set("Cache-Control","no-store");
+    res.json({
+      online:true,
+      account:{
+        id:u.id,
+        name:u.name,
+        email:u.email,
+        createdAt:u.created_at,
+        lastSeen:u.last_seen
+      },
+      wallet:{
+        gems:Number(u.gems||0),
+        gold:Number(u.gold||0),
+        elixir:Number(u.elixir||0)
+      },
+      village:{
+        saved:buildings.length>0,
+        buildings:buildings.length,
+        army:army.length,
+        queue:queue.length,
+        level:Number(gs.level||1),
+        trophies:Number(gs.trophies||0),
+        updatedAt:gs.updatedAt||null
+      },
+      backup:{
+        total:Number(backups.rows[0]?.total||0),
+        latest:backups.rows[0]?.latest||null
+      },
+      matchmaking:{
+        realOpponentsAvailable:Number(opponents.rows[0]?.total||0)
+      }
+    });
+  }catch(e){
+    console.error("account status",e);
+    res.status(500).json({error:"Não foi possível verificar a conta."});
   }
 });
 
@@ -1134,7 +1210,7 @@ async function start() {
     console.log("PostgreSQL conectado e tabelas prontas.");
 
     app.listen(PORT, () => {
-      console.log("Empire Forge API V35.5 Recursos online na porta", PORT);
+      console.log("Empire Forge API V35.10 online na porta", PORT);
     });
 
   } catch (e) {
