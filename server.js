@@ -81,6 +81,19 @@ async function initDb() {
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS game_state JSONB;`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen TIMESTAMPTZ;`);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS game_state_backups (
+      id BIGSERIAL PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      game_state JSONB NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_game_state_backups_user_created
+    ON game_state_backups(user_id, created_at DESC);
+  `);
+
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS pix_orders (
@@ -287,13 +300,53 @@ app.get("/health", async (req, res) => {
   res.json({
     online: true,
     service: "Empire Forge API",
-    version: "35.7-multiplayer",
+    version: "35.8-account-save-backup",
     pixConfigured: !!ACCESS_TOKEN,
     database,
     databaseType: "postgresql",
     packs: [70,170,270,370,470,670], resourcePacks: {gold:299,elixir:399}
   });
 });
+
+
+function newPlayerGameState(name) {
+  return {
+    version: 30,
+    mapVersion: 30,
+    playerName: String(name || "Jogador").slice(0,30),
+    gold: 0,
+    elixir: 0,
+    trophies: 0,
+    xp: 0,
+    level: 1,
+    army: [],
+    queue: [],
+    stats: { collected:0, trained:0, wins:0 },
+    claimed: { collect:false, train:false, win:false },
+    lastChest: 0,
+    shieldUntil: 0,
+    lab: { sword:1, archer:1, giant:1, mage:1 },
+    labQueue: null,
+    hero: { level:1, xp:0 },
+    clan: { name:"Sem clã", points:0 },
+    campaign: 1,
+    season: { xp:0, claimed:0 },
+    achievements: {},
+    war: { wins:0, last:0 },
+    streak: { days:1, last:Date.now() },
+    buildings: [
+      {id:"town1",type:"town",x:8,y:5,level:1,readyAt:0},
+      {id:"gm1",type:"goldmine",x:6,y:3,level:1,readyAt:0,stored:0},
+      {id:"em1",type:"elixirmine",x:11,y:3,level:1,readyAt:0,stored:0},
+      {id:"can1",type:"cannon",x:6,y:8,level:1,readyAt:0},
+      {id:"tow1",type:"tower",x:11,y:8,level:1,readyAt:0},
+      {id:"bar1",type:"barracks",x:8,y:8,level:1,readyAt:0},
+      {id:"camp1",type:"camp",x:10,y:8,level:1,readyAt:0}
+    ],
+    lastTick: Date.now(),
+    updatedAt: Date.now()
+  };
+}
 
 app.post("/api/auth/register", async (req, res) => {
   try {
@@ -323,11 +376,12 @@ app.post("/api/auth/register", async (req, res) => {
     const id = uid("EF");
     const hash = await bcrypt.hash(password, 12);
 
+    const freshState = newPlayerGameState(name);
     const inserted = await pool.query(
-      `INSERT INTO users(id,name,email,phone,password_hash)
-       VALUES($1,$2,$3,$4,$5)
+      `INSERT INTO users(id,name,email,phone,password_hash,game_state,last_seen)
+       VALUES($1,$2,$3,$4,$5,$6::jsonb,NOW())
        RETURNING *`,
-      [id, name, email, phone, hash]
+      [id, name, email, phone, hash, JSON.stringify(freshState)]
     );
 
     const user = inserted.rows[0];
@@ -450,23 +504,75 @@ app.post("/api/resources/add", auth, async (req, res) => {
 
 
 function sanitizeGameState(input) {
-  const s = input && typeof input === "object" ? input : {};
-  const buildings = Array.isArray(s.buildings) ? s.buildings.slice(0,250).map(b => ({
-    id:String(b.id||"").slice(0,80),
-    type:String(b.type||"").slice(0,40),
-    x:Number(b.x||0),
-    y:Number(b.y||0),
-    level:Math.max(1,Number(b.level||1)),
-    readyAt:Number(b.readyAt||0)
+  const x = input && typeof input === "object" ? input : {};
+  const n = (v,d=0) => Number.isFinite(Number(v)) ? Number(v) : d;
+  const bool = v => !!v;
+  const obj = v => v && typeof v === "object" && !Array.isArray(v) ? v : {};
+
+  const buildings = Array.isArray(x.buildings) ? x.buildings.slice(0,300).map(b => ({
+    id:String(b?.id||"").slice(0,80),
+    type:String(b?.type||"").slice(0,40),
+    x:n(b?.x,0), y:n(b?.y,0),
+    level:Math.max(1,n(b?.level,1)),
+    readyAt:Math.max(0,n(b?.readyAt,0)),
+    stored:Math.max(0,n(b?.stored,0))
   })) : [];
 
+  const queue = Array.isArray(x.queue) ? x.queue.slice(0,100).map(q=>({
+    id:String(q?.id||"").slice(0,80),
+    type:String(q?.type||"").slice(0,40),
+    readyAt:Math.max(0,n(q?.readyAt,0)),
+    amount:Math.max(0,n(q?.amount,0))
+  })) : [];
+
+  const army = Array.isArray(x.army)
+    ? x.army.slice(0,500).map(v=>String(v||"").slice(0,40)).filter(Boolean)
+    : [];
+
+  const labIn=obj(x.lab), statsIn=obj(x.stats), claimedIn=obj(x.claimed);
+  const seasonIn=obj(x.season), heroIn=obj(x.hero), clanIn=obj(x.clan);
+  const warIn=obj(x.war), streakIn=obj(x.streak);
+
   return {
-    playerName:String(s.playerName||"Jogador").slice(0,30),
-    trophies:Math.max(0,Number(s.trophies||0)),
-    level:Math.max(1,Number(s.level||1)),
-    gold:Math.max(0,Number(s.gold||0)),
-    elixir:Math.max(0,Number(s.elixir||0)),
-    buildings,
+    version:Math.max(1,n(x.version,30)),
+    mapVersion:Math.max(30,n(x.mapVersion,30)),
+    playerName:String(x.playerName||"Jogador").slice(0,30),
+    gold:Math.max(0,n(x.gold,0)),
+    elixir:Math.max(0,n(x.elixir,0)),
+    trophies:Math.max(0,n(x.trophies,0)),
+    xp:Math.max(0,n(x.xp,0)),
+    level:Math.max(1,n(x.level,1)),
+    army, queue, buildings,
+    selected:null,
+    editMode:false,
+    shopCat:String(x.shopCat||"recursos").slice(0,30),
+    stats:{
+      collected:Math.max(0,n(statsIn.collected,0)),
+      trained:Math.max(0,n(statsIn.trained,0)),
+      wins:Math.max(0,n(statsIn.wins,0))
+    },
+    claimed:{
+      collect:bool(claimedIn.collect),
+      train:bool(claimedIn.train),
+      win:bool(claimedIn.win)
+    },
+    lastChest:Math.max(0,n(x.lastChest,0)),
+    shieldUntil:Math.max(0,n(x.shieldUntil,0)),
+    lab:{
+      sword:Math.max(1,n(labIn.sword,1)),
+      archer:Math.max(1,n(labIn.archer,1)),
+      giant:Math.max(1,n(labIn.giant,1)),
+      mage:Math.max(1,n(labIn.mage,1))
+    },
+    labQueue:x.labQueue && typeof x.labQueue==="object" ? x.labQueue : null,
+    hero:{level:Math.max(1,n(heroIn.level,1)),xp:Math.max(0,n(heroIn.xp,0))},
+    clan:{name:String(clanIn.name||"Sem clã").slice(0,40),points:Math.max(0,n(clanIn.points,0))},
+    campaign:Math.max(1,n(x.campaign,1)),
+    season:{xp:Math.max(0,n(seasonIn.xp,0)),claimed:Math.max(0,n(seasonIn.claimed,0))},
+    achievements:obj(x.achievements),
+    war:{wins:Math.max(0,n(warIn.wins,0)),last:Math.max(0,n(warIn.last,0))},
+    streak:{days:Math.max(1,n(streakIn.days,1)),last:Math.max(0,n(streakIn.last,Date.now()))},
+    lastTick:Math.max(0,n(x.lastTick,Date.now())),
     updatedAt:Date.now()
   };
 }
@@ -474,11 +580,33 @@ function sanitizeGameState(input) {
 app.post("/api/game/state", auth, async (req,res) => {
   try {
     const gameState=sanitizeGameState(req.body?.state);
+
+    // Backup automático no máximo uma vez a cada 10 minutos por conta.
+    await pool.query(`
+      INSERT INTO game_state_backups(user_id,game_state)
+      SELECT $1,$2::jsonb
+      WHERE NOT EXISTS (
+        SELECT 1 FROM game_state_backups
+        WHERE user_id=$1 AND created_at > NOW() - INTERVAL '10 minutes'
+      )
+    `,[req.user.id,JSON.stringify(gameState)]);
+
+    await pool.query(`
+      DELETE FROM game_state_backups
+      WHERE user_id=$1 AND id NOT IN (
+        SELECT id FROM game_state_backups
+        WHERE user_id=$1
+        ORDER BY created_at DESC
+        LIMIT 12
+      )
+    `,[req.user.id]);
+
     await pool.query(
       "UPDATE users SET game_state=$1::jsonb,last_seen=NOW() WHERE id=$2",
       [JSON.stringify(gameState),req.user.id]
     );
-    res.json({ok:true,updatedAt:gameState.updatedAt});
+
+    res.json({ok:true,updatedAt:gameState.updatedAt,backup:true});
   } catch(e) {
     console.error("save game state",e);
     res.status(500).json({error:"Não foi possível salvar a vila."});
@@ -497,6 +625,68 @@ app.get("/api/game/state", auth, async (req,res) => {
     res.status(500).json({error:"Não foi possível carregar a vila."});
   }
 });
+
+
+app.post("/api/game/reset", auth, async (req,res) => {
+  try{
+    const q=await pool.query("SELECT name FROM users WHERE id=$1 LIMIT 1",[req.user.id]);
+    const name=q.rows[0]?.name||"Jogador";
+    const fresh=newPlayerGameState(name);
+
+    await pool.query(
+      "UPDATE users SET game_state=$1::jsonb,gems=0,gold=0,elixir=0,last_seen=NOW() WHERE id=$2",
+      [JSON.stringify(fresh),req.user.id]
+    );
+
+    await pool.query(
+      "INSERT INTO game_state_backups(user_id,game_state) VALUES($1,$2::jsonb)",
+      [req.user.id,JSON.stringify(fresh)]
+    );
+
+    res.json({ok:true,state:fresh});
+  }catch(e){
+    console.error("reset game",e);
+    res.status(500).json({error:"Não foi possível reiniciar a vila."});
+  }
+});
+
+app.get("/api/game/backup/latest", auth, async (req,res) => {
+  try{
+    const {rows}=await pool.query(
+      `SELECT game_state,created_at
+       FROM game_state_backups
+       WHERE user_id=$1
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [req.user.id]
+    );
+    res.set("Cache-Control","no-store");
+    res.json({backup:rows[0]?.game_state||null,createdAt:rows[0]?.created_at||null});
+  }catch(e){
+    res.status(500).json({error:"Não foi possível carregar o backup."});
+  }
+});
+
+app.post("/api/game/backup/restore", auth, async (req,res) => {
+  try{
+    const {rows}=await pool.query(
+      `SELECT game_state FROM game_state_backups
+       WHERE user_id=$1
+       ORDER BY created_at DESC LIMIT 1`,
+      [req.user.id]
+    );
+    if(!rows.length)return res.status(404).json({error:"Nenhum backup disponível."});
+    const state=sanitizeGameState(rows[0].game_state);
+    await pool.query(
+      "UPDATE users SET game_state=$1::jsonb,last_seen=NOW() WHERE id=$2",
+      [JSON.stringify(state),req.user.id]
+    );
+    res.json({ok:true,state});
+  }catch(e){
+    res.status(500).json({error:"Não foi possível restaurar o backup."});
+  }
+});
+
 
 function fallbackOpponent(requester) {
   const lv=Math.max(1,Number(requester?.game_state?.buildings?.find?.(b=>b.type==="town")?.level||1));
