@@ -300,7 +300,7 @@ app.get("/health", async (req, res) => {
   res.json({
     online: true,
     service: "Empire Forge API",
-    version: "35.8-account-save-backup",
+    version: "35.9-real-matchmaking",
     pixConfigured: !!ACCESS_TOKEN,
     database,
     databaseType: "postgresql",
@@ -714,31 +714,63 @@ function fallbackOpponent(requester) {
 
 app.get("/api/opponents/search", auth, async (req,res) => {
   try {
-    await pool.query("UPDATE users SET last_seen=NOW() WHERE id=$1",[req.user.id]);
-    const selfQ=await pool.query("SELECT game_state FROM users WHERE id=$1",[req.user.id]);
+    const requesterId=String(req.user.id);
+
+    await pool.query(
+      "UPDATE users SET last_seen=NOW() WHERE id=$1",
+      [requesterId]
+    );
+
+    const selfQ=await pool.query(
+      "SELECT id,name,game_state FROM users WHERE id=$1 LIMIT 1",
+      [requesterId]
+    );
     const self=selfQ.rows[0]||{};
 
+    // Busca SOMENTE outras contas reais com ID e vila salva.
     const {rows}=await pool.query(
       `SELECT id,name,email,trophies,gold,elixir,game_state,last_seen
        FROM users
-       WHERE id<>$1 AND game_state IS NOT NULL
-       ORDER BY last_seen DESC NULLS LAST, RANDOM()
-       LIMIT 20`,
-      [req.user.id]
+       WHERE id <> $1
+         AND game_state IS NOT NULL
+         AND jsonb_typeof(game_state)='object'
+         AND jsonb_array_length(COALESCE(game_state->'buildings','[]'::jsonb)) > 0
+       ORDER BY
+         CASE WHEN last_seen > NOW() - INTERVAL '7 days' THEN 0 ELSE 1 END,
+         last_seen DESC NULLS LAST,
+         RANDOM()
+       LIMIT 50`,
+      [requesterId]
     );
 
+    // Nenhuma outra conta/vila real: usa a vila manual.
     if(!rows.length){
-      return res.json({found:false,fallback:true,opponent:fallbackOpponent(self)});
+      const fallback=fallbackOpponent(self);
+      return res.json({
+        ok:true,
+        found:false,
+        fallback:true,
+        searchedById:true,
+        requesterId,
+        candidates:0,
+        opponent:fallback
+      });
     }
 
+    // Escolhe uma das contas reais encontradas.
     const row=rows[Math.floor(Math.random()*rows.length)];
     const gs=row.game_state||{};
+
     return res.json({
+      ok:true,
       found:true,
       fallback:false,
+      searchedById:true,
+      requesterId,
+      candidates:rows.length,
       opponent:{
         source:"real",
-        userId:row.id,
+        userId:String(row.id),
         name:row.name||gs.playerName||"Jogador",
         trophies:Number(gs.trophies??row.trophies??0),
         gold:Number(row.gold??gs.gold??0),
@@ -749,7 +781,29 @@ app.get("/api/opponents/search", auth, async (req,res) => {
     });
   } catch(e) {
     console.error("opponent search",e);
-    res.status(500).json({error:"Falha ao buscar oponente."});
+    res.status(500).json({
+      error:"Falha ao buscar oponente real.",
+      detail:process.env.NODE_ENV==="development"?String(e.message||e):undefined
+    });
+  }
+});
+
+app.get("/api/health", async (req,res) => {
+  try{
+    const q=await pool.query("SELECT COUNT(*)::int AS total, COUNT(game_state)::int AS villages FROM users");
+    res.set("Cache-Control","no-store");
+    res.json({
+      online:true,
+      service:"Empire Forge API",
+      version:"35.9-real-matchmaking",
+      database:true,
+      databaseType:"postgresql",
+      users:Number(q.rows[0]?.total||0),
+      villages:Number(q.rows[0]?.villages||0),
+      matchmaking:"real-id"
+    });
+  }catch(e){
+    res.status(503).json({online:false,database:false,error:"database_unavailable"});
   }
 });
 
